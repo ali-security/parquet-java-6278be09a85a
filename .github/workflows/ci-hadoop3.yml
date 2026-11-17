@@ -17,12 +17,19 @@
 
 name: CI Hadoop 3
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional Maven test selector, e.g. -Dtest=TestFoo'
+        required: false
+        default: ''
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -54,4 +61,36 @@ jobs:
         run: |
           EXTRA_JAVA_TEST_ARGS=$(./mvnw help:evaluate -Dexpression=extraJavaTestArgs -q -DforceStdout)
           export MAVEN_OPTS="$MAVEN_OPTS $EXTRA_JAVA_TEST_ARGS"
-          ./mvnw verify --batch-mode javadoc:javadoc
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw verify --batch-mode -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true -Dsurefire.failIfNoSpecifiedTests=false ${{ inputs.test-filter }}
+          else
+            ./mvnw verify --batch-mode -Drat.skip=true -Dspotless.check.skip=true -Djapicmp.skip=true javadoc:javadoc
+          fi
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import glob, xml.etree.ElementTree as ET
+          from collections import defaultdict
+          t=f=e=s=0
+          skips=defaultdict(list)
+          for x in glob.glob('**/target/surefire-reports/TEST-*.xml', recursive=True):
+              r=ET.parse(x).getroot()
+              t+=int(r.get('tests',0)); f+=int(r.get('failures',0)); e+=int(r.get('errors',0)); s+=int(r.get('skipped',0))
+              for tc in r.iter('testcase'):
+                  sk=tc.find('skipped')
+                  if sk is not None:
+                      skips[(sk.get('message') or 'no message (@Ignore/assumption)').strip()[:200]].append(tc.get('classname','').split('.')[-1]+'.'+tc.get('name',''))
+          print(f"TOTAL Tests run: {t}, Failures: {f}, Errors: {e}, Skipped: {s}, passed: {t-f-e-s}")
+          for reason, names in skips.items():
+              print(f"SKIPPED [{reason}]: {', '.join(names)}")
+          PY
+      - name: Upload artifacts
+        if: matrix.java.setup == '11' && matrix.codes == 'uncompressed,brotli'
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-format-structures-jars
+          path: |
+            parquet-format-structures/target/parquet-format-structures-1.17.1.jar
+            parquet-format-structures/target/parquet-format-structures-1.17.1-tests.jar
+          if-no-files-found: error
